@@ -6,10 +6,10 @@ import plotly.express as px
 from datetime import datetime, timezone, date, time as dt_time
 
 # ----------------- Seiten-Konfiguration -----------------
-st.set_page_config(page_title="PZP Auto-Phase Cycle Profiler", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="PZP Cycle Profiler (Toleranz)", page_icon="🎯", layout="wide")
 
-st.title("🎯 PZP Zyklus-Profiler mit Auto-Phase-Alignment")
-st.caption("Findet automatisch den optimalen Zyklus-Startpunkt, an dem die meisten Trendwenden zusammenfallen.")
+st.title("🎯 PZP Zyklus-Profiler mit ±1-Kerzen-Toleranz")
+st.caption("Berücksichtigt Markt-Ungenauigkeiten durch optionale ±1-Kerzen-Toleranz (Cluster-Glättung).")
 
 # US-kompatible Datenquelle (Kraken)
 @st.cache_resource
@@ -46,8 +46,11 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("🔁 Zyklus-Einstellungen")
-    cycle_length = st.number_input("Zykluslänge N (in Kerzen)", min_value=3, max_value=120, value=4, step=1)
+    cycle_length = st.number_input("Zykluslänge N (in Kerzen)", min_value=3, max_value=120, value=6, step=1)
     cycle_count = st.number_input("Anzahl Zyklen zum Vergleichen", min_value=2, max_value=40, value=10, step=1)
+    
+    st.markdown("##### ⏱️ Toleranz-Filter")
+    use_tolerance = st.checkbox("±1-Kerze Toleranz einbeziehen", value=True, help="Zählt einen Zyklus als Treffer, wenn die Trendwende an Pos -1, Pos oder Pos +1 stattfand.")
     
     st.markdown("##### Basis-Startzeitpunkt")
     col_d, col_t = st.columns([1, 1])
@@ -56,7 +59,7 @@ with st.sidebar:
     with col_t:
         start_time_input = st.time_input("Startuhrzeit (UTC)", value=dt_time(0, 0), step=300)
         
-    auto_align = st.checkbox("🎯 Auto-Phase-Alignment (Besten Startpunkt finden)", value=True)
+    auto_align = st.checkbox("🎯 Auto-Phase-Alignment (Startpunkt optimieren)", value=True)
     manual_offset = 0
     if not auto_align:
         manual_offset = st.slider("Manueller Start-Offset (Kerzen)", 0, int(cycle_length - 1), 0)
@@ -137,46 +140,48 @@ df_sub = df[df.index >= start_dt].copy()
 if len(df_sub) < (cycle_count * cycle_length + cycle_length):
     available_cycles = (len(df_sub) - cycle_length) // cycle_length
     if available_cycles < 2:
-        st.error(f"Zu wenige Kerzen ab Startzeitpunkt vorhanden. Bitte wähle ein früheres Startdatum.")
+        st.error("Zu wenige Kerzen ab Startzeitpunkt vorhanden. Bitte wähle ein früheres Startdatum.")
         st.stop()
     cycle_count = available_cycles
 
 # ----------------- Phasen-Optimierung -----------------
-# Testet alle Offsets (0 bis cycle_length - 1) durch
 phase_eval = []
 
 for offset in range(int(cycle_length)):
-    # Zyklen ab Offset schneiden
     sub_slice = df_sub.iloc[offset : offset + cycle_count * cycle_length].copy()
     sub_slice['Position'] = [idx % cycle_length for idx in range(len(sub_slice))]
     sub_slice['Cycle_ID'] = [idx // cycle_length + 1 for idx in range(len(sub_slice))]
     
-    # Berechne max. Trefferquote an einer Position
-    max_hit_rate = 0.0
+    max_rate = 0.0
     best_pos = 0
-    total_cluster_score = 0.0
+    total_score = 0.0
     
     for pos in range(cycle_length):
-        turns_at_pos = sub_slice[(sub_slice['Position'] == pos) & (sub_slice['has_turn'] == True)]
-        hit_cycles = turns_at_pos['Cycle_ID'].nunique()
+        if use_tolerance:
+            # Positionen mit zyklischem Wrap-Around: (pos - 1) % N, pos, (pos + 1) % N
+            valid_pos = [(pos - 1) % cycle_length, pos, (pos + 1) % cycle_length]
+            turns = sub_slice[(sub_slice['Position'].isin(valid_pos)) & (sub_slice['has_turn'] == True)]
+        else:
+            turns = sub_slice[(sub_slice['Position'] == pos) & (sub_slice['has_turn'] == True)]
+            
+        hit_cycles = turns['Cycle_ID'].nunique()
         pct = (hit_cycles / cycle_count) * 100
-        total_cluster_score += pct**2  # Quadratische Gewichtung bevorzugt deutliche Spitzen
-        if pct > max_hit_rate:
-            max_hit_rate = pct
+        total_score += pct**2
+        if pct > max_rate:
+            max_rate = pct
             best_pos = pos
             
     start_time_actual = sub_slice.index[0]
     phase_eval.append({
         "Offset (Kerzen)": offset,
         "Effektiver Start": start_time_actual.strftime("%d.%m.%y %H:%M"),
-        "Spitzen-Trefferquote (%)": round(max_hit_rate, 1),
+        "Spitzen-Trefferquote (%)": round(max_rate, 1),
         "Beste Position": best_pos,
-        "Score": total_cluster_score
+        "Score": total_score
     })
 
 phase_df = pd.DataFrame(phase_eval)
 
-# Besten Offset ermitteln
 if auto_align:
     best_phase_row = phase_df.sort_values(by=["Spitzen-Trefferquote (%)", "Score"], ascending=False).iloc[0]
     chosen_offset = int(best_phase_row["Offset (Kerzen)"])
@@ -191,71 +196,84 @@ df_final['Cycle_ID'] = [idx // cycle_length + 1 for idx in range(len(df_final))]
 
 position_stats = []
 for pos in range(cycle_length):
-    turns_at_pos = df_final[(df_final['Position'] == pos) & (df_final['has_turn'] == True)]
-    unique_cycles = turns_at_pos['Cycle_ID'].nunique()
-    pct = round((unique_cycles / cycle_count) * 100, 1)
+    # Exakte Treffer
+    exact_turns = df_final[(df_final['Position'] == pos) & (df_final['has_turn'] == True)]
+    exact_cycles = exact_turns['Cycle_ID'].nunique()
+    exact_pct = round((exact_cycles / cycle_count) * 100, 1)
+    
+    # Treffer mit ±1 Kerze Toleranz
+    valid_pos = [(pos - 1) % cycle_length, pos, (pos + 1) % cycle_length]
+    tol_turns = df_final[(df_final['Position'].isin(valid_pos)) & (df_final['has_turn'] == True)]
+    tol_cycles = tol_turns['Cycle_ID'].nunique()
+    tol_pct = round((tol_cycles / cycle_count) * 100, 1)
+    
     position_stats.append({
         "Position": pos,
-        "Trendwechsel (Zyklen)": f"{unique_cycles} / {cycle_count}",
-        "Trefferquote (%)": pct
+        "Exakt (%)": exact_pct,
+        "Mit ±1 Toleranz (%)": tol_pct,
+        "Treffer Zyklen (Toleranz)": f"{tol_cycles} / {cycle_count}"
     })
 
 stats_df = pd.DataFrame(position_stats)
+display_metric = "Mit ±1 Toleranz (%)" if use_tolerance else "Exakt (%)"
 
 # ----------------- UI Dashboard -----------------
 if auto_align:
-    st.success(f"🎯 **Bester Startpunkt gefunden:** Versatz um **+{chosen_offset} Kerzen** führt zu einer Spitzen-Trefferquote von **{best_phase_row['Spitzen-Trefferquote (%)']}%** auf Position **{int(best_phase_row['Beste Position'])}**!")
+    st.success(f"🎯 **Bester Startpunkt gefunden:** Versatz um **+{chosen_offset} Kerzen** erzielt **{best_phase_row['Spitzen-Trefferquote (%)']}% Treffer** auf Position **{int(best_phase_row['Beste Position'])}** ({'inkl. ±1 Toleranz' if use_tolerance else 'exakt'})!")
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Gewählter Offset", f"+{chosen_offset} Kerzen")
 col2.metric("Effektiver Zyklus 1 Start", f"{df_final.index[0].strftime('%d.%m.%y %H:%M')}")
 col3.metric("Zykluslänge", f"{cycle_length} Kerzen ({tf_choice})")
-top_res = stats_df.sort_values(by="Trefferquote (%)", ascending=False).iloc[0]
-col4.metric("Höchste Konzentration", f"Pos {int(top_res['Position'])}", f"{top_res['Trefferquote (%)']}% Treffer")
+top_res = stats_df.sort_values(by=display_metric, ascending=False).iloc[0]
+col4.metric(f"Top-Cluster ({display_metric})", f"Pos {int(top_res['Position'])}", f"{top_res[display_metric]}% Treffer")
 
 st.markdown("---")
 
-# Visualisierung
+# Interaktives Balkendiagramm mit Vergleich Exakt vs. Toleranz
 st.subheader("📊 Wahrscheinlichkeitsverteilung über den Zyklus")
+plot_df = stats_df.melt(id_vars=["Position"], value_vars=["Exakt (%)", "Mit ±1 Toleranz (%)"], 
+                        var_name="Methode", value_name="Quote")
+
 fig = px.bar(
-    stats_df,
+    plot_df,
     x="Position",
-    y="Trefferquote (%)",
-    text="Trefferquote (%)",
-    labels={"Position": f"Kerzen-Index im Zyklus (0 bis {cycle_length - 1})", "Trefferquote (%)": "Wahrscheinlichkeit (%)"},
-    title=f"Optimierte Zyklus-Verteilung ({selected_coin} / {tf_choice}) – Start: {df_final.index[0].strftime('%d.%m.%Y %H:%M UTC')}"
+    y="Quote",
+    color="Methode",
+    barmode="group",
+    text="Quote",
+    labels={"Position": f"Kerzenposition im Zyklus (0 bis {cycle_length - 1})", "Quote": "Wahrscheinlichkeit (%)"},
+    title=f"Zyklus-Trefferquote: Exakt vs. mit ±1 Kerze Toleranz ({selected_coin} / {tf_choice})",
+    color_discrete_map={"Exakt (%)": "#3b82f6", "Mit ±1 Toleranz (%)": "#089981"}
 )
-fig.update_traces(
-    marker_color='#089981',
-    texttemplate='%{text:.1f}%',
-    textposition='outside'
-)
+fig.update_traces(texttemplate='%{text:.0f}%', textposition='outside')
 fig.update_layout(
-    yaxis=dict(range=[0, 110]),
+    yaxis=dict(range=[0, 115]),
     xaxis=dict(tickmode='linear', dtick=1),
     template="plotly_dark",
-    height=420
+    height=450
 )
 st.plotly_chart(fig, use_container_width=True)
 
-# Detailansicht & Phasenvergleich
-tab1, tab2, tab3 = st.tabs(["🏆 Rangliste & Matrix", "🔬 Phasen-Vergleich (Alle Varianten)", "📅 Zyklus-Zeiten"])
+# Detailansichten
+tab1, tab2, tab3 = st.tabs(["🏆 Rangliste & Matrix", "🔬 Phasen-Vergleich", "📅 Zyklus-Zeiten"])
 
 with tab1:
     c1, c2 = st.columns([1, 1])
     with c1:
         st.markdown("##### Rangliste der Positionen")
         st.dataframe(
-            stats_df.sort_values(by="Trefferquote (%)", ascending=False),
+            stats_df.sort_values(by=display_metric, ascending=False),
             column_config={
                 "Position": st.column_config.NumberColumn("Position", format="%d"),
-                "Trefferquote (%)": st.column_config.ProgressColumn("Trefferquote", format="%.1f%%", min_value=0, max_value=100)
+                "Exakt (%)": st.column_config.ProgressColumn("Exakt", format="%.1f%%", min_value=0, max_value=100),
+                "Mit ±1 Toleranz (%)": st.column_config.ProgressColumn("Mit Toleranz (±1)", format="%.1f%%", min_value=0, max_value=100)
             },
             use_container_width=True,
             hide_index=True
         )
     with c2:
-        st.markdown("##### Treffer-Matrix je Zyklus")
+        st.markdown("##### Treffer-Matrix je Zyklus (Exakte Lage)")
         piv = pd.crosstab(
             index=df_final['Cycle_ID'],
             columns=df_final['Position'],
@@ -267,11 +285,11 @@ with tab1:
 
 with tab2:
     st.markdown("##### Vergleich aller getesteten Start-Offsets")
-    st.caption("Das System hat alle Versatz-Möglichkeiten durchgerechnet. Der hervorgehobene Offset liefert die stärkste Bündelung:")
+    st.caption("Zeigt die maximale Trefferquote für jeden möglichen Startversatz:")
     st.dataframe(
         phase_df.drop(columns=["Score"]),
         column_config={
-            "Spitzen-Trefferquote (%)": st.column_config.ProgressColumn("Spitzen-Trefferquote", format="%.1f%%", min_value=0, max_value=100),
+            "Spitzen-Trefferquote (%)": st.column_config.ProgressColumn("Spitzenquote", format="%.1f%%", min_value=0, max_value=100),
             "Offset (Kerzen)": st.column_config.NumberColumn("Verschiebung", format="%d")
         },
         use_container_width=True,
